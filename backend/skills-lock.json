@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "integrate": {
+      "source": "sahyll/juspay-skills",
+      "sourceType": "github",
+      "skillPath": "skills/integrate/SKILL.md",
+      "computedHash": "4dcd370d66d2eca1a2899921ef6dc682ce5a7e81dd7715781d1fc72042fcacc1"
+    }
+  }
+}

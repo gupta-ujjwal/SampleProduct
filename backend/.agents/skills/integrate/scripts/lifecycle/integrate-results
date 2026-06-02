@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# Lifecycle recorder for /integrate workflow. Manages step records and workflow
+# state in a JSON file. JSON processing: jq (primary) → python3/python
+# (fallback) → exit 2 with SKILL_FALLBACK message.
+#
+# SECURITY: This script structurally refuses to store sensitive fields (keys,
+# secrets, passwords, tokens). Credentials must stay in env vars, never in the
+# results file. Verification strings must also be credential-free — the caller
+# is responsible for that.
+#
+# Usage:
+#   integrate-results init
+#   integrate-results step-start <name>
+#   integrate-results step-end <status> "<verification>" ["<reason>"]
+#   integrate-results step <name> <status> "<verification>" <startedAt> <completedAt> ["<reason>"]
+#   integrate-results set <field> <value>
+#
+# Every mutation echoes a one-line confirmation on stdout:
+#   init       — init: startedAt=<ts>
+#   step-start — pending: <name>
+#   step-end   — recorded: <name> <status> (steps=<count>, pending=<none|name>)
+#   step       — recorded: <name> <status> (steps=<count>)
+#   set        — set: <field>=<value>
+#
+# Exit codes:
+#   0 — success
+#   1 — usage or logic error
+#   2 — no JSON processor found (SKILL_FALLBACK)
+
+set -euo pipefail
+
+FILE=".integrate-results.json"
+
+cmd="${1:?Usage: integrate-results <init|step-start|step-end|step|set> ...}"
+shift
+
+# ── JSON processor detection: jq → python3 → python → exit 2 ──────────────
+if command -v jq &>/dev/null; then
+  JQ=jq
+
+elif command -v python3 &>/dev/null || command -v python &>/dev/null; then
+  _PY="$(command -v python3 2>/dev/null || command -v python)"
+  # Hand off entirely to Python. exec replaces this shell process.
+  # Inside Python: sys.argv == ['-', cmd, ...original-args...]
+  exec "$_PY" - "$cmd" "$@" <<'PYEOF'
+import sys, json, os, re, datetime
+
+FILE = ".integrate-results.json"
+SENSITIVE = re.compile(r'key|secret|password|token', re.IGNORECASE)
+
+def now_utc():
+    try:
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except AttributeError:
+        return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def read_file():
+    with open(FILE) as fh:
+        return json.load(fh)
+
+def write_file(data):
+    tmp = FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, FILE)
+
+def check_sensitive(field):
+    if SENSITIVE.search(field):
+        sys.stderr.write(
+            "integrate-results: refusing to store sensitive field '{}'"
+            " — keep credentials in env vars only\n".format(field)
+        )
+        sys.exit(1)
+
+argv = sys.argv[1:]
+if not argv:
+    sys.stderr.write("Usage: integrate-results <init|step-start|step-end|step|set> ...\n")
+    sys.exit(1)
+
+cmd, rest = argv[0], argv[1:]
+
+if cmd == "init":
+    started = now_utc()
+    write_file({"workflow": "integrate", "startedAt": started,
+                "active": "working", "status": "running", "steps": []})
+    sys.stdout.write("init: startedAt={}\n".format(started))
+
+elif cmd == "step-start":
+    if not rest:
+        sys.stderr.write("integrate-results: name required\n"); sys.exit(1)
+    name = rest[0]
+    started = now_utc()
+    data = read_file()
+    existing = (data.get("pendingStep") or {}).get("name", "")
+    if existing:
+        sys.stderr.write(
+            "integrate-results: pendingStep '{}' already active"
+            " — call step-end before starting '{}'\n".format(existing, name)
+        )
+        sys.exit(1)
+    data["pendingStep"] = {"name": name, "startedAt": started}
+    write_file(data)
+    sys.stdout.write("pending: {}\n".format(name))
+
+elif cmd == "step-end":
+    if len(rest) < 2:
+        sys.stderr.write("integrate-results: status and verification required\n"); sys.exit(1)
+    status, verif = rest[0], rest[1]
+    reason = rest[2] if len(rest) > 2 else ""
+    completed = now_utc()
+    data = read_file()
+    pending = data.get("pendingStep") or {}
+    name = pending.get("name", "")
+    started = pending.get("startedAt", "")
+    if not name:
+        sys.stderr.write("integrate-results: no pendingStep — call step-start first\n"); sys.exit(1)
+    step = {"name": name, "status": status, "verification": verif,
+            "startedAt": started, "completedAt": completed}
+    if reason:
+        step["reason"] = reason
+    data.setdefault("steps", []).append(step)
+    data.pop("pendingStep", None)
+    write_file(data)
+    count = len(data["steps"])
+    sys.stdout.write("recorded: {} {} (steps={}, pending=none)\n".format(name, status, count))
+
+elif cmd == "step":
+    if len(rest) < 5:
+        sys.stderr.write(
+            "integrate-results: name status verification startedAt completedAt required\n"
+        )
+        sys.exit(1)
+    name, status, verif, started, completed = rest[:5]
+    reason = rest[5] if len(rest) > 5 else ""
+    _now = now_utc()
+    if started == "now":   started   = _now
+    if completed == "now": completed = _now
+    data = read_file()
+    step = {"name": name, "status": status, "verification": verif,
+            "startedAt": started, "completedAt": completed}
+    if reason:
+        step["reason"] = reason
+    data.setdefault("steps", []).append(step)
+    write_file(data)
+    count = len(data["steps"])
+    sys.stdout.write("recorded: {} {} (steps={})\n".format(name, status, count))
+
+elif cmd == "set":
+    if len(rest) < 2:
+        sys.stderr.write("integrate-results: field and value required\n"); sys.exit(1)
+    field, value = rest[0], rest[1]
+    check_sensitive(field)
+    data = read_file()
+    if value == "true":    data[field] = True
+    elif value == "false": data[field] = False
+    else:                  data[field] = value
+    write_file(data)
+    sys.stdout.write("set: {}={}\n".format(field, value))
+
+else:
+    sys.stderr.write("Unknown command: {}\n".format(cmd))
+    sys.stderr.write("Usage: integrate-results <init|step-start|step-end|step|set> ...\n")
+    sys.exit(1)
+PYEOF
+
+else
+  printf 'integrate-results: no JSON processor available (need jq, python3, or python)\n' >&2
+  printf 'SKILL_FALLBACK: result tracking unavailable — continue workflow without timing data\n' >&2
+  exit 2
+fi
+
+# ── jq path (only reached when jq is available) ───────────────────────────
+
+_check_sensitive_field() {
+  local field
+  field="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$field" in
+    *key*|*secret*|*password*|*token*)
+      echo "integrate-results: refusing to store sensitive field '$1' — keep credentials in env vars only" >&2
+      exit 1
+      ;;
+  esac
+}
+
+case "$cmd" in
+  init)
+    startedAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    cat > "$FILE" <<ENDJSON
+{
+  "workflow": "integrate",
+  "startedAt": "$startedAt",
+  "active": "working",
+  "status": "running",
+  "steps": []
+}
+ENDJSON
+    echo "init: startedAt=$startedAt"
+    ;;
+
+  step-start)
+    name="${1:?name required}"
+    startedAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    existing="$($JQ -r '.pendingStep.name // empty' "$FILE")"
+    if [ -n "$existing" ]; then
+      echo "integrate-results: pendingStep '$existing' already active — call step-end before starting '$name'" >&2
+      exit 1
+    fi
+    $JQ --arg n "$name" --arg sa "$startedAt" \
+       '.pendingStep = {"name":$n,"startedAt":$sa}' \
+       "$FILE" > "${FILE}.tmp" && mv "${FILE}.tmp" "$FILE"
+    echo "pending: $name"
+    ;;
+
+  step-end)
+    status="${1:?status required (passed|failed|skipped)}"
+    verif="${2:?verification required}"
+    reason="${3:-}"
+    completedAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    name="$($JQ -r '.pendingStep.name // empty' "$FILE")"
+    startedAt="$($JQ -r '.pendingStep.startedAt // empty' "$FILE")"
+    if [ -z "$name" ] || [ -z "$startedAt" ]; then
+      echo "integrate-results: no pendingStep — call step-start first" >&2
+      exit 1
+    fi
+
+    if [ -n "$reason" ]; then
+      $JQ --arg n "$name" --arg s "$status" --arg v "$verif" \
+         --arg sa "$startedAt" --arg ca "$completedAt" --arg r "$reason" \
+         '.steps += [{"name":$n,"status":$s,"verification":$v,"startedAt":$sa,"completedAt":$ca,"reason":$r}] | del(.pendingStep)' \
+         "$FILE" > "${FILE}.tmp" && mv "${FILE}.tmp" "$FILE"
+    else
+      $JQ --arg n "$name" --arg s "$status" --arg v "$verif" \
+         --arg sa "$startedAt" --arg ca "$completedAt" \
+         '.steps += [{"name":$n,"status":$s,"verification":$v,"startedAt":$sa,"completedAt":$ca}] | del(.pendingStep)' \
+         "$FILE" > "${FILE}.tmp" && mv "${FILE}.tmp" "$FILE"
+    fi
+    count="$($JQ -r '.steps | length' "$FILE")"
+    pending="$($JQ -r '.pendingStep.name // "none"' "$FILE")"
+    echo "recorded: $name $status (steps=$count, pending=$pending)"
+    ;;
+
+  step)
+    name="${1:?name required}"
+    status="${2:?status required (passed|failed|skipped)}"
+    verif="${3:?verification required}"
+    startedAt="${4:?startedAt required}"
+    completedAt="${5:?completedAt required}"
+    reason="${6:-}"
+
+    [[ "$startedAt" == "now" ]] && startedAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    [[ "$completedAt" == "now" ]] && completedAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    if [ -n "$reason" ]; then
+      $JQ --arg n "$name" --arg s "$status" --arg v "$verif" \
+         --arg sa "$startedAt" --arg ca "$completedAt" --arg r "$reason" \
+         '.steps += [{"name":$n,"status":$s,"verification":$v,"startedAt":$sa,"completedAt":$ca,"reason":$r}]' \
+         "$FILE" > "${FILE}.tmp" && mv "${FILE}.tmp" "$FILE"
+    else
+      $JQ --arg n "$name" --arg s "$status" --arg v "$verif" \
+         --arg sa "$startedAt" --arg ca "$completedAt" \
+         '.steps += [{"name":$n,"status":$s,"verification":$v,"startedAt":$sa,"completedAt":$ca}]' \
+         "$FILE" > "${FILE}.tmp" && mv "${FILE}.tmp" "$FILE"
+    fi
+    count="$($JQ -r '.steps | length' "$FILE")"
+    echo "recorded: $name $status (steps=$count)"
+    ;;
+
+  set)
+    field="${1:?field required}"
+    value="${2:?value required}"
+    _check_sensitive_field "$field"
+    if [ "$value" = "true" ] || [ "$value" = "false" ]; then
+      $JQ --arg f "$field" --argjson v "$value" '.[$f] = $v' "$FILE" > "${FILE}.tmp" && mv "${FILE}.tmp" "$FILE"
+    else
+      $JQ --arg f "$field" --arg v "$value" '.[$f] = $v' "$FILE" > "${FILE}.tmp" && mv "${FILE}.tmp" "$FILE"
+    fi
+    echo "set: $field=$value"
+    ;;
+
+  *)
+    echo "Unknown command: $cmd" >&2
+    echo "Usage: integrate-results <init|step-start|step-end|step|set> ..." >&2
+    exit 1
+    ;;
+esac

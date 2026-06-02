@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ACME Store</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; color: #333; }
+    .header { background: #1a1a2e; color: white; padding: 20px 40px; display: flex; justify-content: space-between; align-items: center; }
+    .header h1 { font-size: 24px; }
+    .header .env-badge { background: #e94560; padding: 4px 12px; border-radius: 12px; font-size: 12px; }
+    .banner { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; text-align: center; padding: 24px; font-size: 18px; }
+    .container { max-width: 1000px; margin: 30px auto; padding: 0 20px; }
+    .products { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 24px; margin-top: 20px; }
+    .product-card { background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1); transition: transform 0.2s; }
+    .product-card:hover { transform: translateY(-4px); }
+    .product-card img { width: 100%; height: 200px; object-fit: cover; background: #eee; }
+    .product-card .info { padding: 16px; }
+    .product-card .name { font-size: 18px; font-weight: 600; }
+    .product-card .desc { color: #666; font-size: 14px; margin: 8px 0; }
+    .product-card .price { font-size: 22px; font-weight: 700; color: #1a1a2e; }
+    .product-card .stock { font-size: 12px; color: #888; margin-top: 4px; }
+    .pay-btn { width: 100%; margin-top: 12px; padding: 12px; background: #e94560; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+    .pay-btn:hover { background: #c81e45; }
+    .pay-btn:disabled { background: #ccc; cursor: not-allowed; }
+    .loading { text-align: center; padding: 40px; font-size: 18px; color: #666; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1 id="merchant-name">Loading...</h1>
+    <span class="env-badge">SANDBOX</span>
+  </div>
+  <div class="banner" id="banner">Loading...</div>
+  <div class="container">
+    <h2>Our Products</h2>
+    <div class="products" id="products">
+      <div class="loading">Loading products...</div>
+    </div>
+  </div>
+
+  <script>
+    const API_BASE = 'http://localhost:3000';
+    const USER_ID = 'user-001';
+
+    async function init() {
+      const homeRes = await fetch(`${API_BASE}/api/homepage`);
+      const homeData = await homeRes.json();
+      document.getElementById('merchant-name').textContent = homeData.merchantName;
+      document.getElementById('banner').textContent = homeData.bannerText;
+
+      const prodRes = await fetch(`${API_BASE}/api/products`);
+      const prodData = await prodRes.json();
+      renderProducts(prodData.products);
+    }
+
+    function renderProducts(products) {
+      const container = document.getElementById('products');
+      container.innerHTML = products.map(p => `
+        <div class="product-card">
+          <img src="${p.imageUrl || 'https://placehold.co/300x200?text=Product'}" alt="${p.name}">
+          <div class="info">
+            <div class="name">${p.name}</div>
+            <div class="desc">${p.description || ''}</div>
+            <div class="price">${p.currency} ${p.price.toLocaleString('en-IN')}</div>
+            <div class="stock">${p.stock} in stock</div>
+            <button class="pay-btn" onclick="handlePay('${p.id}', ${p.price})">
+              Pay ${p.currency} ${p.price.toLocaleString('en-IN')}
+            </button>
+          </div>
+        </div>
+      `).join('');
+    }
+
+    async function handlePay(productId, price) {
+      const btn = event.target;
+      btn.disabled = true;
+      btn.textContent = 'Processing...';
+
+      try {
+        const orderRes = await fetch(`${API_BASE}/api/orders`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userId: USER_ID,
+            items: [{ productId, quantity: 1 }],
+          }),
+        });
+        const orderData = await orderRes.json();
+
+        window.location.href = `fulfillment.html?paymentId=${orderData.payment.id}&orderId=${orderData.order.id}`;
+      } catch (err) {
+        alert('Payment failed: ' + err.message);
+        btn.disabled = false;
+        btn.textContent = `Pay INR ${price.toLocaleString('en-IN')}`;
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>

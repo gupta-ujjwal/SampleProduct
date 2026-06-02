@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# /integrate workflow's done step — reads .integrate-results.json and emits a
+# markdown timing table plus a FACTS block the agent uses to compose
+# optimization suggestions. JSON processing: jq (primary) → python3/python
+# (fallback) → exit 2 with SKILL_FALLBACK message.
+#
+# Usage:
+#   done
+#
+# Stdout layout:
+#   <markdown timing table>
+#
+#   <slowest-step line>
+#
+#   <<<FACTS
+#   totalSeconds=<int>
+#   slowestStep=<name>
+#   slowestSeconds=<int>
+#   dominantSteps=<comma-separated step names that took >=30% of total>
+#   skippedSteps=<comma-separated name:reason pairs>
+#   failedSteps=<comma-separated step names>
+#   product=<product id or "unknown">
+#   platform=<platform id or "unknown">
+#   productType=<sdk|api-only|hybrid|"unknown">
+#   FACTS
+#
+# Exit codes:
+#   0 — success
+#   1 — results file not found or other error
+#   2 — no JSON processor found (SKILL_FALLBACK)
+
+set -euo pipefail
+
+FILE=".integrate-results.json"
+[ -f "$FILE" ] || { echo "done: $FILE not found — cannot produce summary" >&2; exit 1; }
+
+# ── JSON processor detection: jq → python3 → python → exit 2 ──────────────
+if command -v jq &>/dev/null; then
+  JQ=jq
+
+elif command -v python3 &>/dev/null || command -v python &>/dev/null; then
+  _PY="$(command -v python3 2>/dev/null || command -v python)"
+  exec "$_PY" - <<'PYEOF'
+import sys, json, os, datetime, calendar
+
+FILE = ".integrate-results.json"
+
+if not os.path.exists(FILE):
+    sys.stderr.write("done: {} not found — cannot produce summary\n".format(FILE))
+    sys.exit(1)
+
+with open(FILE) as fh:
+    data = json.load(fh)
+
+def iso_to_epoch(ts):
+    dt = datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+    return calendar.timegm(dt.timetuple())
+
+def fmt_dur(s):
+    if s < 60:
+        return "{}s".format(s)
+    return "{}m {}s".format(s // 60, s % 60)
+
+steps = data.get("steps", [])
+
+total_start = steps[0]["startedAt"]  if steps else data.get("startedAt", "")
+total_end   = steps[-1]["completedAt"] if steps else data.get("startedAt", "")
+total_start_epoch = iso_to_epoch(total_start) if total_start else 0
+total_end_epoch   = iso_to_epoch(total_end)   if total_end   else 0
+total_dur = max(0, total_end_epoch - total_start_epoch)
+
+slowest_name = ""
+slowest_dur  = 0
+dominant = []
+skipped  = []
+failed   = []
+rows     = []
+
+for step in steps:
+    name   = step.get("name",   "")
+    status = step.get("status", "")
+    start  = step.get("startedAt",   "")
+    end    = step.get("completedAt", "")
+    verif  = step.get("verification", "") or ""
+    reason = step.get("reason", "")       or ""
+
+    start_e = iso_to_epoch(start) if start else 0
+    end_e   = iso_to_epoch(end)   if end   else 0
+    d = max(0, end_e - start_e)
+
+    if   status == "passed":  icon = "✓"
+    elif status == "failed":  icon = "✗";  failed.append(name)
+    elif status == "skipped": icon = "—";  skipped.append("{}:{}".format(name, reason or "unspecified"))
+    else:                     icon = "?"
+
+    if status != "skipped":
+        if d > slowest_dur:
+            slowest_dur  = d
+            slowest_name = name
+        if total_dur > 0 and (d * 100 // total_dur) >= 30:
+            dominant.append(name)
+
+    dur_str = fmt_dur(d)
+    if status != "skipped" and total_dur > 0 and (d * 100 // total_dur) >= 30:
+        dur_str = "**{}**".format(dur_str)
+
+    verif_clean = verif.replace("\n", " ").replace("|", "\\|")
+    rows.append("| {} | {} | {} | {} |".format(name, icon, dur_str, verif_clean))
+
+sys.stdout.write("| Step | Status | Duration | Verification |\n")
+sys.stdout.write("|------|--------|----------|---------------|\n")
+for row in rows:
+    sys.stdout.write(row + "\n")
+sys.stdout.write("| **Total** | | **{}** | |\n".format(fmt_dur(total_dur)))
+sys.stdout.write("\n")
+
+if slowest_name:
+    sys.stdout.write("**Slowest step**: `{}` ({})\n".format(slowest_name, fmt_dur(slowest_dur)))
+
+product     = data.get("product",     "unknown") or "unknown"
+platform    = data.get("platform",    "unknown") or "unknown"
+productType = data.get("productType", "unknown") or "unknown"
+
+sys.stdout.write("\n")
+sys.stdout.write("<<<FACTS\n")
+sys.stdout.write("totalSeconds={}\n".format(total_dur))
+sys.stdout.write("slowestStep={}\n".format(slowest_name))
+sys.stdout.write("slowestSeconds={}\n".format(slowest_dur))
+sys.stdout.write("dominantSteps={}\n".format(",".join(dominant)))
+sys.stdout.write("skippedSteps={}\n".format(",".join(skipped)))
+sys.stdout.write("failedSteps={}\n".format(",".join(failed)))
+sys.stdout.write("product={}\n".format(product))
+sys.stdout.write("platform={}\n".format(platform))
+sys.stdout.write("productType={}\n".format(productType))
+sys.stdout.write("FACTS\n")
+PYEOF
+
+else
+  printf 'done: no JSON processor available (need jq, python3, or python)\n' >&2
+  printf 'SKILL_FALLBACK: timing summary unavailable — skip done phase, continue without timing data\n' >&2
+  exit 2
+fi
+
+# ── jq path (only reached when jq is available) ───────────────────────────
+
+iso_to_epoch() {
+  local iso="$1"
+  if date -u -d "$iso" +%s 2>/dev/null; then
+    return
+  fi
+  date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$iso" +%s
+}
+
+fmt_dur() {
+  local s=$1
+  if [ "$s" -lt 60 ]; then
+    echo "${s}s"
+  else
+    printf "%dm %ds" $(( s / 60 )) $(( s % 60 ))
+  fi
+}
+
+total_start="$($JQ -r '[.steps[].startedAt] | first // .startedAt' "$FILE")"
+total_start_epoch="$(iso_to_epoch "$total_start")"
+
+last_end="$($JQ -r '[.steps[].completedAt] | last // .startedAt' "$FILE")"
+last_end_epoch="$(iso_to_epoch "$last_end")"
+
+total_dur=$(( last_end_epoch - total_start_epoch ))
+[ "$total_dur" -lt 0 ] && total_dur=0
+
+slowest_name=""
+slowest_dur=0
+dominant=()
+skipped=()
+failed=()
+rows=()
+
+while IFS=$'\t' read -r name status start end verif reason; do
+  start_e="$(iso_to_epoch "$start")"
+  end_e="$(iso_to_epoch "$end")"
+  d=$(( end_e - start_e ))
+  [ "$d" -lt 0 ] && d=0
+
+  case "$status" in
+    passed)  icon="✓" ;;
+    failed)  icon="✗"; failed+=("$name") ;;
+    skipped) icon="—"; skipped+=("$name:${reason:-unspecified}") ;;
+    *)       icon="?" ;;
+  esac
+
+  if [ "$status" != "skipped" ]; then
+    if [ "$d" -gt "$slowest_dur" ]; then
+      slowest_dur=$d
+      slowest_name=$name
+    fi
+    if [ "$total_dur" -gt 0 ] && [ $(( d * 100 / total_dur )) -ge 30 ]; then
+      dominant+=("$name")
+    fi
+  fi
+
+  dur_str="$(fmt_dur "$d")"
+  if [ "$status" != "skipped" ] && [ "$total_dur" -gt 0 ] && [ $(( d * 100 / total_dur )) -ge 30 ]; then
+    dur_str="**$dur_str**"
+  fi
+
+  verif_clean="$(echo "${verif:-}" | tr '\n' ' ' | sed 's/|/\\|/g')"
+  rows+=("| $name | $icon | $dur_str | $verif_clean |")
+done < <(
+  $JQ -r '.steps[] | [.name, .status, .startedAt, .completedAt, (.verification // ""), (.reason // "")] | @tsv' "$FILE"
+)
+
+echo "| Step | Status | Duration | Verification |"
+echo "|------|--------|----------|--------------|"
+for row in "${rows[@]}"; do
+  echo "$row"
+done
+echo "| **Total** | | **$(fmt_dur "$total_dur")** | |"
+echo
+
+if [ -n "$slowest_name" ]; then
+  echo "**Slowest step**: \`$slowest_name\` ($(fmt_dur "$slowest_dur"))"
+fi
+
+product="$($JQ -r '.product // "unknown"' "$FILE")"
+platform="$($JQ -r '.platform // "unknown"' "$FILE")"
+productType="$($JQ -r '.productType // "unknown"' "$FILE")"
+
+join_csv() { local IFS=,; echo "$*"; }
+echo
+echo "<<<FACTS"
+echo "totalSeconds=$total_dur"
+echo "slowestStep=$slowest_name"
+echo "slowestSeconds=$slowest_dur"
+echo "dominantSteps=$(join_csv "${dominant[@]+${dominant[@]}}")"
+echo "skippedSteps=$(join_csv "${skipped[@]+${skipped[@]}}")"
+echo "failedSteps=$(join_csv "${failed[@]+${failed[@]}}")"
+echo "product=$product"
+echo "platform=$platform"
+echo "productType=$productType"
+echo "FACTS"
